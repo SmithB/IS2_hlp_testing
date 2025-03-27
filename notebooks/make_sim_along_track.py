@@ -19,6 +19,7 @@ def R_WGS84(latitude):
     return Re * (1-f*np.sin(latitude*np.pi/180)**2)
 
 def calc_xatc(rgt1):
+
     # calculate the along-track distance measured along rgt1
 
     dLat = np.diff(rgt1.latitude)
@@ -50,10 +51,11 @@ def shift_atc(D, dxy, ind=None, inplace=True, assign_vectors=True, return_new=Fa
     delta = s_hat[ind] * dxy[0] + 1j*s_hat[ind]*dxy[1]
 
     if inplace:
+        # return_new is false, shift the original structure
         D.x[ind] += np.real(delta)
         D.y[ind] += np.imag(delta)
         return
-
+    # return_new is true, make a new structure with 'x' and 'y' fields
     x1 = D.x
     y1 = D.y
     x1[ind] += np.real(delta)
@@ -65,7 +67,9 @@ def shift_atc(D, dxy, ind=None, inplace=True, assign_vectors=True, return_new=Fa
         return x1, y1
 
 def to_xy(latitude, longitude, lat_0, lon_0):
+
     # convert latitude and longitudue to platte-carre x, y
+
     r=R_WGS84(lat_0)
     lat_scale=(r*2*np.pi/360.)
     lon_scale=(r*2*np.pi/360.*np.cos(lat_0*np.pi/180))
@@ -74,6 +78,7 @@ def to_xy(latitude, longitude, lat_0, lon_0):
     return x, y
 
 def to_latlon(x, y, lat_0, lon_0):
+
     # convert platte-carre x, y to latitude, longitude
 
     r=R_WGS84(lat_0)
@@ -84,6 +89,7 @@ def to_latlon(x, y, lat_0, lon_0):
     return latitude, longitude
 
 def calc_azimuth(D, lat0, lon0):
+
     # calculate the azimuth of a track WRT local north
     if D.EPSG is None:
         x1, y1 = to_xy(D.latitude+0.001, D.longitude, lat0, lon0)
@@ -102,6 +108,35 @@ def calc_azimuth(D, lat0, lon0):
 def apply_shifts(D, key_vars, sigma, dims=['y'], shifts=None, shift_dict=None, update_yatc=False):
     '''
     Shift the tracks in D in along-track coordinates.
+
+
+    Parameters
+    ----------
+    D : pointColection.data
+        data structures.
+    key_vars : list
+        fields in D.  One shift will be applied for each unique combination of these
+    sigma : float
+        standard deviation of shifts.
+    dims : list, optional
+        directions in which tracks will be shifted. The default is ['y'].
+    shifts : numpy array, optional
+        Optional array of shifts  The array must have one column for each
+        dimension to be shifted, and one value for each unique track. If None,
+        shifts are chosen at random.  The default is None.
+    shift_dict : dictionary, optional
+        Optional dictionary identifying the data points for each track.  If
+        None, will be calculated. The default is None.
+    update_yatc : boolean, optional
+        If true, the y_atc value in D will be updated to match the shifts. The default is False.
+
+    Returns
+    -------
+    shift_dict : dict
+        dictionary identifying the data points for each track
+    shifts : numpy array
+        Shifts for each track.
+
     '''
     if shift_dict is not None:
         shift_keys=list(shift_dict.keys())
@@ -121,9 +156,44 @@ def apply_shifts(D, key_vars, sigma, dims=['y'], shifts=None, shift_dict=None, u
     return shift_dict, shifts
 
 
-def apply_errors(D_noE, z_fn = None, z_args=None, sigma=None):
+def apply_errors(D_noE, z_fn = None, z_args=None, sigma=None, calc_gradient=True):
+    '''
+    Calculate the height and errors for a data structure
 
-    default_sigma = {'geoloc':3.5,'r':0.03,'z_corr':0.03,'z_uncorr':0.15/np.sqrt(57)}
+    Parameters
+    ----------
+    D_noE : pointCollection.data
+        Data structure to which errors will be added.
+    z_fn : function, optional
+        function that calculates the height from a data structure. The default is None.
+    z_args : dict, optional
+        a dictionary of arguments that will be passed to z_fn. The default is None.
+    sigma : dict, optional
+        a dictionary of parameter for errors.
+        Default values are:
+            geoloc:3.5   horizontal geolocation uncertainty
+            r : 0.03 radial orbit uncertainty
+            fp : 5.5 footprint width
+            fp_per_seg: 57 number of footprints in each segment
+            pulse_z: 0.1  pluse width expressed in range
+            z_uncorr: 0.013 per-segment height uncertainty, used if the gradient is not calculated
+            The default is None.
+    calc_gradient : boolean, optional
+        If True, the gradient of the surface is calculated and is used in the
+        calculation of the per-footprint error. The default is True.
+
+    Returns
+    -------
+    data : pointCollection.data
+        data structure including errors.
+
+    '''
+    default_sigma = {'geoloc':3.5,
+                     'r':0.03,
+                     'fp_per_seg':57,
+                     'fp':5.5,
+                     'pulse_z':0.68*0.15,
+                     'z_uncorr':0.68*0.15/np.sqrt(57)}
     temp=default_sigma.copy()
     temp.update(sigma)
     sigma=temp
@@ -135,17 +205,41 @@ def apply_errors(D_noE, z_fn = None, z_args=None, sigma=None):
     data.assign(z=z_fn(D_noE, **z_args),
                 DEM_h=z_fn(data, **z_args))
 
+    if calc_gradient:
+        temp=D_noE.copy()
+        temp.x += 1
+        data.assign(dz_dx = z_fn(temp, **z_args) - data.z)
+        temp=D_noE.copy()
+        temp.y += 1
+        data.assign(dz_dy = z_fn(temp, **z_args) - data.z)
+        data.assign(slope_mag = np.sqrt(data.dz_dx**2+data.dz_dy**2))
+
     # assign random and correlated errors
     e_corr = np.random.randn(len(cr_dict)) * sigma['r']
     for ii, ee in zip(cr_dict.values(), e_corr):
         data.z[ii] += ee
-    data.z += np.random.randn(data.size)* sigma['z_uncorr']
+
+    # if we have calculated the slope magnitude, calculate the per-segment error
+    # based on the surface slope, the footprint size, and the pulse width
+    if 'slope_mag' in data.fields:
+        if 'beam' in data.fields:
+            sigma_pulse = sigma['pulse_z']/np.sqrt(4+8*data.beam)
+        else:
+            sigma_pulse = sigma['pulse_z']/np.sqrt(8)
+
+        sigma_mag = np.sqrt(sigma_pulse**2 +(sigma['fp']*data.slope_mag)**2)/np.sqrt(sigma['fp_per_seg'])
+        data.z += np.random.randn(data.size)*sigma_mag
+        data.assign(sigma=np.zeros_like(data.x)+sigma_mag)
+    else:
+        data.z += np.random.randn(data.size)* sigma['z_uncorr']
+        data.assign(sigma=np.zeros_like(data.x)+sigma['z_uncorr'])
 
     return data
 
 def calc_along_track_slope(D, sigma_z, z_fn, **z_args):
 
     # calculate the along-track slope for D, given a z function and a vertical error
+
     z_temp=[None, None]
     for jj, dx in enumerate([-10, 10]):
         temp=D.copy()
@@ -154,14 +248,73 @@ def calc_along_track_slope(D, sigma_z, z_fn, **z_args):
     D.assign(dh_fit_dx = (z_temp[1]-z_temp[0])/20)
     D.assign(dh_fit_dx_sigma = sigma_z*np.sqrt(2) /20. + np.zeros_like(D.x))
 
+def z_DEM(D, DEM=None, return_DEM=False, xy0=None, W=None, DEM_file=None, dz_of_t = None):
+    '''
+    read DEM data from a file and interpolate it to data points
+    '''
+    pad=np.array([-W/2-3300, W/2+3300])
+    if DEM is None:
+        DEM=pc.grid.data().from_file(DEM_file, bounds=[xy0[0]+pad, xy0[1]+pad])
+
+    if isinstance(D, (list, tuple)):
+        z=DEM.interp(*D)
+    else:
+        z = DEM.interp(D.x, D.y)
+    if dz_of_t is None:
+        if return_DEM:
+            return z, DEM
+        else:
+            return z
+    if 't' in dz_of_t:
+        z += np.interp(D.t, dz_of_t.t, dz_of_t.z)
+    elif 'function' in dz_of_t:
+        z += dz_of_t['function'](D, **dz_of_t['args'])
+    if return_DEM:
+        return z, DEM
+    else:
+        return z
+
 
 def make_sim_tracks( cycles=np.arange(1, 11), W_data = 5.e4,
-                    rgt_file='rgt_001.h5', lat_0=70, lon_0=0, x_0=None, y_0=None,
+                    rgt_file='RGT_001.h5', lat_0=70, lon_0=0, x_0=None, y_0=None,
                     EPSG=None,
                     product='ATL11', t_unit='days'):
+    '''
+    Make a simulated set of data
+
+    Parameters
+    ----------
+    cycles : iterable, optional
+        cycles to be included in the data. The default is np.arange(1, 11).
+    W_data : float, optional
+        width of the data (lat/lon square). The default is 5.e4.
+    rgt_file : str, optional
+        filename for a RGT data. The default is 'RGT_001.h5'.
+    lat_0 : str, optional
+        latitude center of the data. The default is 70.
+    lon_0 : str, optional
+        longitude center of the data. The default is 0.
+    x_0 : str, optional
+        projected x center of the data, used instead of lat_0, lon_0. The default is None.
+    y_0 : TYPE, optional
+        projected y center of the data, used instead of lat_0, lon_0. The default is None.
+    EPSG : int, optional
+        If specified, simulation results will be in projected coordinates instead
+        of platte carre. The default is None.
+    product : str, optional
+        can be 'ATL11' or 'ATL06. The default is 'ATL11'.
+    t_unit : str, optional
+        time units. Can be 'seconds, 'days' or 'years. The default is 'days'.
+
+    Returns
+    -------
+    pointCollection.data: data structure
+
+    '''
+
 
     if x_0 is not None and EPSG is not None:
-        temp=pc.data().from_dict({'x':[x_0], 'y':[y_0]}).get_latlon(EPSG)
+        temp=pc.data().from_dict({'x':np.array([x_0]), 'y':np.array([y_0])}).get_latlon(EPSG)
         lat_0 = temp.latitude[0]
         lon_0 = temp.longitude[0]
 
@@ -250,7 +403,8 @@ def make_sim_tracks( cycles=np.arange(1, 11), W_data = 5.e4,
         x0=0
         y0=0
     else:
-        temp=pc.data().from_dict({'latitude':[lat_0],'longitude':[lon_0]}).get_xy(EPSG=EPSG)
+        temp=pc.data().from_dict({'latitude':np.array([lat_0]),
+                                  'longitude':np.array([lon_0])}).get_xy(EPSG=EPSG)
         x0, y0 = [temp.x, temp.y]
 
     D_cycle1.index(np.all(np.abs(np.c_[D_cycle1.x-x0, D_cycle1.y-y0]) < W_data/2+200, axis=1))
@@ -259,10 +413,13 @@ def make_sim_tracks( cycles=np.arange(1, 11), W_data = 5.e4,
     D=[]
     for cycle in cycles:
         D_cycle=D_cycle1.copy()
-        D_cycle.t += 91*cycle
+        D_cycle.t += 91*(cycle-1)
         D_cycle.assign(cycle=np.zeros_like(D_cycle.t)+cycle)
         D += [D_cycle]
     D=pc.data().from_list(D)
+
+    if EPSG is not None:
+        D.get_latlon(EPSG=EPSG)
 
     # time unit is days, can convert to seconds or years
     if t_unit=='year' or t_unit=='years' or t_unit == 'yr':
@@ -323,4 +480,3 @@ if False:
                  max_iterations=1,
                  bias_params=bias_params,
                  VERBOSE=True, dzdt_lags=[1])
-
